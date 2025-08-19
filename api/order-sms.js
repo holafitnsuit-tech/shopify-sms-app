@@ -2,18 +2,16 @@
 // Sends order confirmation SMS via BulkSMSBD when Shopify webhook fires.
 
 const crypto = require('crypto');
-const fetch = require('node-fetch');
+// const fetch = require('node-fetch'); // Not needed on Vercel (global fetch available)
 
-// 🔑 Directly set API Key & Sender ID (for testing)
-// Better: keep them in Vercel Environment Variables
+// 🔑 For quick test you hardcoded; best is Env Vars.
 const API_KEY   = "CqGUEe5Vmqt8yPKo7K8t";
 const SENDER_ID = "8809617617772";
 
-// Option A (recommended): HMAC verification if you use a Custom App webhook
+// Option A: Custom App HMAC (not needed if you use token)
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || "";
 
-// Option B (simpler): URL token fallback if you use Notifications → Webhooks
-// Example: https://your-vercel.vercel.app/api/order-sms?token=YOUR_TOKEN
+// Option B: Simple token via URL query
 const ORDER_WEBHOOK_TOKEN = process.env.ORDER_WEBHOOK_TOKEN || "";
 
 // --- helpers ---
@@ -22,15 +20,9 @@ function bad(res, code, msg) { return res.status(code).json({ success:false, err
 
 function verifyHmac(rawBody, hmacHeader, secret) {
   if (!hmacHeader || !secret) return false;
-  const digest = crypto
-    .createHmac('sha256', secret)
-    .update(rawBody, 'utf8')
-    .digest('base64');
-  try {
-    return crypto.timingSafeEqual(Buffer.from(hmacHeader), Buffer.from(digest));
-  } catch {
-    return false;
-  }
+  const digest = crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('base64');
+  try { return crypto.timingSafeEqual(Buffer.from(hmacHeader), Buffer.from(digest)); }
+  catch { return false; }
 }
 
 function normalizeBD(phone) {
@@ -47,7 +39,8 @@ async function sendSMS(number, text) {
   const msg = encodeURIComponent(text);
   const url = `http://bulksmsbd.net/api/smsapi?api_key=${encodeURIComponent(API_KEY)}&type=text&number=${encodeURIComponent(number)}&senderid=${encodeURIComponent(SENDER_ID)}&message=${msg}`;
   const r = await fetch(url);
-  return { ok: r.ok, body: await r.text().catch(()=> '') };
+  const body = await r.text().catch(()=>'');
+  return { ok: r.ok, body };
 }
 
 module.exports = async (req, res) => {
@@ -63,12 +56,10 @@ module.exports = async (req, res) => {
     const raw = JSON.stringify(req.body || {});
     const hmacHeader = req.headers['x-shopify-hmac-sha256'];
 
+    // Allow if (A) HMAC ok OR (B) token matches
     let allowed = false;
-    if (SHOPIFY_WEBHOOK_SECRET) {
-      allowed = verifyHmac(raw, hmacHeader, SHOPIFY_WEBHOOK_SECRET);
-    } else if (ORDER_WEBHOOK_TOKEN) {
-      allowed = req.query && req.query.token === ORDER_WEBHOOK_TOKEN;
-    }
+    if (SHOPIFY_WEBHOOK_SECRET) allowed = verifyHmac(raw, hmacHeader, SHOPIFY_WEBHOOK_SECRET);
+    else if (ORDER_WEBHOOK_TOKEN) allowed = req.query && req.query.token === ORDER_WEBHOOK_TOKEN;
 
     if (!allowed) return bad(res, 401, 'unauthorized');
 
@@ -76,12 +67,13 @@ module.exports = async (req, res) => {
     const phone =
       order?.shipping_address?.phone ||
       order?.customer?.phone ||
-      order?.billing_address?.phone ||
-      '';
+      order?.billing_address?.phone || '';
 
     const number = normalizeBD(phone);
+
     if (!/^8801[3-9]\d{8}$/.test(number)) {
-      return ok(res, { success:true, skipped:'missing_or_invalid_phone' });
+      console.log('skip: invalid or missing phone', { phone, number });
+      return ok(res, { success: true, skipped: 'missing_or_invalid_phone' });
     }
 
     const name = order?.customer?.first_name || order?.shipping_address?.first_name || 'Customer';
@@ -90,10 +82,12 @@ module.exports = async (req, res) => {
     const statusUrl = order?.order_status_url || '';
 
     const text = `ধন্যবাদ ${name}! আপনার অর্ডার ${orderNo} নিশ্চিত হয়েছে। মোট: ৳${total}. ট্র্যাক: ${statusUrl}`;
-
     const out = await sendSMS(number, text);
+
+    console.log('sms result', { number, orderNo, ok: out.ok, provider: out.body?.slice(0,200) });
     return ok(res, { success: out.ok, provider_response: out.body });
   } catch (e) {
+    console.error('server_error', e);
     return bad(res, 500, 'server_error');
   }
 };
