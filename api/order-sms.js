@@ -1,21 +1,23 @@
 // api/order-sms.js
 // Sends order confirmation SMS via BulkSMSBD when Shopify webhook fires.
+// Works with Shopify "Order creation" or "Order paid" webhooks.
+// Uses simple token auth via ?token=... OR HMAC (if SHOPIFY_WEBHOOK_SECRET set).
 
 const crypto = require('crypto');
-// const fetch = require('node-fetch'); // Not needed on Vercel (global fetch available)
 
-// 🔑 For quick test you hardcoded; best is Env Vars.
+// 🔒 For quick testing you asked to hardcode these.
+// ✅ Recommended for production: use Vercel Env Vars instead.
 const API_KEY   = "CqGUEe5Vmqt8yPKo7K8t";
 const SENDER_ID = "8809617617772";
 
-// Option A: Custom App HMAC (not needed if you use token)
+// Option A (recommended): verify HMAC if you create a Custom App webhook
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET || "";
 
-// Option B: Simple token via URL query
+// Option B (simple): token via URL (?token=...) + Vercel Env `ORDER_WEBHOOK_TOKEN`
 const ORDER_WEBHOOK_TOKEN = process.env.ORDER_WEBHOOK_TOKEN || "";
 
-// --- helpers ---
-function ok(res, body) { return res.status(200).json(body); }
+// ---------- helpers ----------
+function ok(res, body)  { return res.status(200).json(body); }
 function bad(res, code, msg) { return res.status(code).json({ success:false, error: msg }); }
 
 function verifyHmac(rawBody, hmacHeader, secret) {
@@ -39,11 +41,15 @@ async function sendSMS(number, text) {
   const msg = encodeURIComponent(text);
   const url = `http://bulksmsbd.net/api/smsapi?api_key=${encodeURIComponent(API_KEY)}&type=text&number=${encodeURIComponent(number)}&senderid=${encodeURIComponent(SENDER_ID)}&message=${msg}`;
   const r = await fetch(url);
-  const body = await r.text().catch(()=>'');
+  const body = await r.text().catch(()=> '');
   return { ok: r.ok, body };
 }
 
+// ---------- handler ----------
 module.exports = async (req, res) => {
+  console.log('>> webhook hit', { method: req.method, query: req.query });
+
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Shopify-Hmac-Sha256');
@@ -56,12 +62,18 @@ module.exports = async (req, res) => {
     const raw = JSON.stringify(req.body || {});
     const hmacHeader = req.headers['x-shopify-hmac-sha256'];
 
-    // Allow if (A) HMAC ok OR (B) token matches
+    // Auth: allow if (A) HMAC OK OR (B) token matches
     let allowed = false;
-    if (SHOPIFY_WEBHOOK_SECRET) allowed = verifyHmac(raw, hmacHeader, SHOPIFY_WEBHOOK_SECRET);
-    else if (ORDER_WEBHOOK_TOKEN) allowed = req.query && req.query.token === ORDER_WEBHOOK_TOKEN;
+    if (SHOPIFY_WEBHOOK_SECRET) {
+      allowed = verifyHmac(raw, hmacHeader, SHOPIFY_WEBHOOK_SECRET);
+    } else if (ORDER_WEBHOOK_TOKEN) {
+      allowed = req.query && req.query.token === ORDER_WEBHOOK_TOKEN;
+    }
 
-    if (!allowed) return bad(res, 401, 'unauthorized');
+    if (!allowed) {
+      console.warn('>> unauthorized webhook');
+      return bad(res, 401, 'unauthorized');
+    }
 
     const order = req.body || {};
     const phone =
@@ -72,7 +84,7 @@ module.exports = async (req, res) => {
     const number = normalizeBD(phone);
 
     if (!/^8801[3-9]\d{8}$/.test(number)) {
-      console.log('skip: invalid or missing phone', { phone, number });
+      console.log('>> skip: missing_or_invalid_phone', { raw: phone, normalized: number });
       return ok(res, { success: true, skipped: 'missing_or_invalid_phone' });
     }
 
@@ -82,12 +94,13 @@ module.exports = async (req, res) => {
     const statusUrl = order?.order_status_url || '';
 
     const text = `ধন্যবাদ ${name}! আপনার অর্ডার ${orderNo} নিশ্চিত হয়েছে। মোট: ৳${total}. ট্র্যাক: ${statusUrl}`;
+
     const out = await sendSMS(number, text);
 
-    console.log('sms result', { number, orderNo, ok: out.ok, provider: out.body?.slice(0,200) });
+    console.log('>> sms result', { number, orderNo, ok: out.ok, provider: out.body?.slice(0,200) });
     return ok(res, { success: out.ok, provider_response: out.body });
   } catch (e) {
-    console.error('server_error', e);
+    console.error('>> server_error', e);
     return bad(res, 500, 'server_error');
   }
 };
